@@ -1,0 +1,889 @@
+#!/bin/bash
+#
+# git-ci-wait
+#
+# Roland Walker
+# walker@pobox.com
+#
+# Simplified BSD License:
+#
+#  Redistribution and use in source and binary forms, with or
+#  without modification, are permitted provided that the following
+#  conditions are met:
+#
+#    1. Redistributions of source code must retain the above
+#       copyright notice, this list of conditions and the following
+#       disclaimer.
+#
+#    2. Redistributions in binary form must reproduce the above
+#       copyright notice, this list of conditions and the following
+#       disclaimer in the documentation and/or other materials
+#       provided with the distribution.
+#
+#  This software is provided by Roland Walker "AS IS" and any express
+#  or implied warranties, including, but not limited to, the implied
+#  warranties of merchantability and fitness for a particular
+#  purpose are disclaimed.  In no event shall Roland Walker or
+#  contributors be liable for any direct, indirect, incidental,
+#  special, exemplary, or consequential damages (including, but not
+#  limited to, procurement of substitute goods or services; loss of
+#  use, data, or profits; or business interruption) however caused
+#  and on any theory of liability, whether in contract, strict
+#  liability, or tort (including negligence or otherwise) arising in
+#  any way out of the use of this software, even if advised of the
+#  possibility of such damage.
+#
+#  The views and conclusions contained in the software and
+#  documentation are those of the authors and should not be
+#  interpreted as representing official policies, either expressed
+#  or implied, of Roland Walker.
+#
+# notes
+#
+#     try_hooks/success_hook/failure_hook intentionally undocumented
+#
+# bugs
+#
+#     Occasionally returns immediately after git push -f && git ci-wait .
+#     Can try 2 or higher here: git config ci-wait.before-poll-seconds 2 .
+#
+# todo
+#
+#     Perhaps don't show progress bar unless tracking progress since CI init.
+#
+#     Dynamically raise slow_poll_seconds when historical runtimes are greater
+#     than 10 minutes.  The value could be median runtime/15.
+#
+
+###
+### settings
+###
+
+set -e
+set -o pipefail
+set +o histexpand
+set -o nounset
+shopt -s nocasematch
+shopt -s nullglob
+shopt -s dotglob
+
+###
+### global variables
+###
+
+# integer/boolean settings overridable via git-config
+before_poll_seconds=1
+slow_poll_seconds=40
+fast_poll_seconds=10
+fast_poll_percent=85
+timeout_seconds=3600
+exit_early_on_fail=1
+progress_bar_width=20
+try_progress_bar=1
+try_emit_bell=1
+try_sound_player=1
+try_desktop_notify=0
+try_hooks=0
+
+# path settings overridable via git-config
+if [[ "$OSTYPE" =~ ^[Dd]arwin ]]; then
+    sound_player='afplay'
+    increment_sound=''       # /System/Library/Sounds/Bottle.aiff
+    if [[ -d '/Library/Audio/Apple Loops/Apple/iLife Sound Effects' ]]; then
+        success_sound='/Library/Audio/Apple Loops/Apple/iLife Sound Effects/Sci-Fi/Computer Data 02.caf'
+        failure_sound='/Library/Audio/Apple Loops/Apple/iLife Sound Effects/Stingers/Comedy Low Honk.caf'
+    else
+        success_sound='/System/Library/Sounds/Glass.aiff'
+        failure_sound='/System/Library/Sounds/Sosumi.aiff'
+    fi
+else
+    # assume Linux, tested on Ubuntu, could do better
+    sound_player='aplay'
+    increment_sound=''       # /usr/share/sounds/sound-icons/chord-7.wav
+    success_sound='/usr/share/sounds/sound-icons/prompt.wav'
+    failure_sound='/usr/share/sounds/sound-icons/pipe.wav'
+fi
+
+success_hook=''
+failure_hook=''
+
+# CLI targets
+declare -a opt_targets=()
+
+# internal
+progname='git-ci-wait'
+version='1.00'
+
+_try_success_hook=0
+_try_failure_hook=0
+
+# could be configurable
+progress_bar_fill='⠿'
+progress_bar_space='⠀'
+progress_bar_borders='[]'
+keep_historical_stats=10
+
+###
+### functions
+###
+
+###
+### functions utility
+###
+
+warn () {
+    local prefix=''
+    local opt_raw=''
+    local opt_escapes=''
+    while [[ "$#" -ge 1 ]]; do
+        case "${1:-}" in
+            -raw|--raw)
+                shift
+                opt_raw='1'
+                ;;
+            -escapes|--escapes)
+                shift
+                opt_escapes='1'
+                ;;
+            --)
+                shift
+                break
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    if [[ -z "$opt_raw" && -n "${progname:-}" ]]; then
+        prefix="$progname: "
+    fi
+
+    local message="$*"
+    [[ -z "$message" ]] && message="Empty message!"
+
+    if [[ -n "$opt_escapes" ]]; then
+        print -v message -- "$message"
+    fi
+    message="${message%"${message##*[![:space:]]}"}"
+    printf "%s%s\n" "$prefix" "$message" 1>&2
+}
+
+die () {
+    warn "$*"
+    exit 1
+}
+
+string_median () {
+    local tally num_elements median_pos median
+
+    # expected format 1+2+3+4
+    tally="${1:-0}"
+
+    num_elements="$(printf '%s\n' "$tally" | grep -Eo '[0-9]+' | grep -c .)"
+    median_pos="$(( num_elements / 2 ))"
+    if (( ! median_pos )); then
+        median_pos=1
+    fi
+
+    median="$(printf '%s\n' "$tally" | grep -Eo '[0-9]+' | sort -n | head -"$median_pos" | tail -1)"
+    printf '%s' "$median"
+}
+
+format_elapsed () {
+    local elapsed="${1:-0}"
+    local mins="$(( elapsed / 60 ))"
+    local secs="$(( elapsed % 60 ))"
+    printf '%sm %02ds' "$mins" "$secs"
+}
+
+parse_elapsed () {
+    local pretty_elapsed="${1:-0m0s}"
+    if ! [[ "$pretty_elapsed" =~ m ]]; then
+        pretty_elapsed="0m $pretty_elapsed"
+    fi
+    local mins="${pretty_elapsed%%m*}"
+    local secs="${pretty_elapsed#*m}"
+          secs="${secs%s}"
+          secs="${secs#[[:space:]]}"
+    printf '%s' "$(( secs + 60 * mins ))"
+}
+
+fetch_rolling_elapsed () {
+    local category tally
+
+    category="${1:-success}"
+
+    tally="$(git config --local "ci-wait.rolling-elapsed-$category" || true)"
+
+    string_median "$tally"
+}
+
+clear_rolling_elapsed () {
+    local category
+
+    category="${1:-success}"
+
+    git config --local --unset "ci-wait.rolling-elapsed-$category" >/dev/null 2>&1 || true
+}
+
+update_rolling_elapsed () {
+    local category new_elapsed tally and_fetch trim
+
+    category="${1:-success}"
+    new_elapsed="${2:-}"
+    and_fetch="${3:-}"
+
+    if (( ! keep_historical_stats )); then
+        if [[ -n "$and_fetch" ]]; then
+            printf 0
+        fi
+        return
+    fi
+
+    trim="$(( keep_historical_stats - 1 ))"
+    if (( trim < 1 )); then
+        trim=1
+    fi
+
+    if [[ -z "$new_elapsed" ]]; then
+        if [[ -n "$and_fetch" ]]; then
+            printf 0
+        fi
+        return
+    fi
+
+    # keep up to $trim trailing elements
+    tally="$(git config --local "ci-wait.rolling-elapsed-$category" | grep -Eo '[0-9]+' | tail -"$trim" | xargs || true)"
+    if [[ -n "$tally" ]]; then
+        tally="$tally $new_elapsed"
+    else
+        tally="$new_elapsed"
+    fi
+
+    git config --local "ci-wait.rolling-elapsed-$category" "$tally"
+
+    if [[ -n "$and_fetch" ]]; then
+        string_median "$tally"
+    fi
+}
+
+longest_test_elapsed () {
+    local checks_tsv="${1:-}"
+
+    local pretty_longest_elapsed longest_elapsed
+
+    if [[ -z "$checks_tsv" ]]; then
+        printf '0'
+        return
+    fi
+    if ! pretty_longest_elapsed="$(printf '%s\n' "$checks_tsv" | cut -f3 | sort -V | tail -1)"; then
+        printf '0'
+        return
+    fi
+    if [[ -z "$pretty_longest_elapsed" ]]; then
+        printf '0'
+        return
+    fi
+    longest_elapsed="$(parse_elapsed "$pretty_longest_elapsed")"
+
+    printf '%s' "${longest_elapsed:-0}"
+}
+
+ensure_target () {
+    local target="${1:-}"
+    if ! gh pr view "$target" >/dev/null 2>&1; then
+        die "${target:-current branch}" 'does not correspond to a PR'
+    fi
+}
+
+###
+### functions initialization
+###
+
+ensure_bash_version () {
+    if [[ "${BASH_VERSINFO[0]:-0}" -lt 3 || ("${BASH_VERSINFO[0]:-0}" -eq 3 && "${BASH_VERSINFO[1]:-0}" -lt 1) ]]; then
+        die 'requires bash 3.1 or higher'
+    fi
+}
+
+ensure_git_on_path () {
+    if ! command -v git >/dev/null 2>&1; then
+        die 'git executable not found'
+    fi
+}
+
+ensure_in_repo () {
+    if ! git rev-parse HEAD >/dev/null 2>&1; then
+        die 'not in a git repo'
+    fi
+}
+
+ensure_gh_on_path () {
+    if ! command -v gh >/dev/null 2>&1; then
+        die 'gh executable not found. Visit https://github.com/cli/cli .'
+    fi
+}
+
+ensure_gh_runs () {
+    if ! gh api repos/:owner/:repo/readme >/dev/null 2>&1; then
+        die 'gh failed: is auth configured? Try "gh auth login".'
+    fi
+}
+
+fetch_gitconfig_settings () {
+    local config_table integer_setting path_setting value
+
+    # gsub because bash variable forms use "_", but gitconfig entries use "-".
+    if ! config_table="$(git config --get-regexp '^ci-wait\.' | awk 'gsub(/-/,"_", $1)')"; then
+        return
+    fi
+    if [[ -z "$config_table" ]]; then
+        return
+    fi
+
+    local min_slow_poll_seconds=20
+    local min_fast_poll_seconds=5
+    local min_fast_poll_percent=75
+    for integer_setting in before_poll_seconds slow_poll_seconds fast_poll_seconds     \
+                           fast_poll_percent timeout_seconds exit_early_on_fail        \
+                           try_emit_bell try_desktop_notify try_sound_player try_hooks \
+                           progress_bar_width try_progress_bar                         \
+                           ; do
+        if value="$(printf '%s\n' "$config_table" | grep -E "^ci_wait\\.$integer_setting" | cut -f2- -d' ')"; then
+            if [[ "$value" = "ci_wait.$integer_setting" || "$value" = "false" ]]; then
+                value=0
+            elif [[ "$value" = "true" ]]; then
+                value=1
+            fi
+
+            # backstop: be nice to GitHub
+            if [[ "$integer_setting" = "slow_poll_seconds" && "$value" -lt "$min_slow_poll_seconds" ]]; then
+                value="$min_slow_poll_seconds"
+            elif [[ "$integer_setting" = "fast_poll_seconds" && "$value" -lt "$min_fast_poll_seconds" ]]; then
+                value="$min_fast_poll_seconds"
+            elif [[ "$integer_setting" = "fast_poll_percent" && "$value" -lt "$min_fast_poll_percent" ]]; then
+                value="$min_fast_poll_percent"
+            fi
+
+            # -v requires bash 3.1
+            printf -v "$integer_setting" '%s' "$value"
+        fi
+    done
+
+    for path_setting in sound_player increment_sound success_sound failure_sound \
+                        success_hook failure_hook; do
+        if value="$(printf '%s\n' "$config_table" | grep -E "^ci_wait\\.$path_setting" | cut -f2- -d' ')"; then
+            if [[ "$value" = "ci_wait.$path_setting" || "$value" = "false" ]]; then
+                value=''
+            fi
+            if [[ "${value:0:2}" = '~/' ]]; then
+                value="$HOME/${value#\~/}"
+            fi
+            # -v requires bash 3.1
+            printf -v "$path_setting" '%s' "$value"
+        fi
+    done
+}
+
+check_sound_player () {
+    if (( try_sound_player )) && ! command -v "$sound_player" >/dev/null 2>&1; then
+        try_sound_player=0
+    fi
+}
+
+check_desktop_notify () {
+    if (( try_desktop_notify )); then
+        if [[ "$OSTYPE" =~ ^[Dd]arwin ]]; then
+            if ! command -v osascript >/dev/null 2>&1; then
+                try_desktop_notify=0
+            fi
+        else
+            # assume Linux, tested on Ubuntu, could do better
+            if ! command -v notify-send >/dev/null 2>&1; then
+                try_desktop_notify=0
+            fi
+        fi
+    fi
+}
+
+check_hooks () {
+    if (( try_hooks )); then
+        _try_success_hook=1
+        _try_failure_hook=1
+        if ! command -v "$success_hook" >/dev/null 2>&1; then
+            _try_success_hook=0
+        fi
+        if ! command -v "$failure_hook" >/dev/null 2>&1; then
+            _try_failure_hook=0
+        fi
+    fi
+}
+
+init_progress_bar () {
+    local fill_char="${progress_bar_fill:0:1}"
+    local space_char="${progress_bar_space:0:1}"
+
+    # eval sanitization
+    if ! [[ "$progress_bar_width" =~ ^[0-9]+$ ]]; then
+        progress_bar_width=20
+    fi
+
+    progress_bar_fill="$(eval "printf '$fill_char%.0s' {1..$progress_bar_width}")"
+    progress_bar_space="$(printf '%s' "$progress_bar_fill" | tr '[:print:]' "$space_char")"
+}
+
+###
+### functions user interaction/events
+###
+
+maybe_create_progress_bar () {
+    local elapsed="${1:-0}"
+    local longest_test="${2:-0}"
+    local mdn_elapsed="${3:-0}"
+    local pending_checks="${4:-1}"
+
+    local percentage fraction
+
+    if ! (( try_progress_bar && progress_bar_width && mdn_elapsed )); then
+        return
+    fi
+
+    if (( longest_test > elapsed )); then
+        elapsed="$longest_test"
+    fi
+
+    if (( elapsed > mdn_elapsed )); then
+        elapsed="$mdn_elapsed"
+    fi
+
+    percentage="$(( (100 * elapsed) / mdn_elapsed ))"
+    if (( ! pending_checks )); then
+        percentage=100
+    elif (( pending_checks && percentage == 100 )); then
+        percentage=99
+    fi
+
+    fraction="$(( (percentage * progress_bar_width) / 100 ))"
+
+    printf '%s%s%s%s%3i%% ' "${progress_bar_borders:0:1}"                         \
+                            "${progress_bar_fill:0:$fraction}"                    \
+                            "${progress_bar_space:$fraction:$progress_bar_width}" \
+                            "${progress_bar_borders:1:2}"                         \
+                            "$percentage"
+}
+
+maybe_emit_bell () {
+    local tty='/dev/tty'
+
+    if (( !try_emit_bell )); then
+        return
+    fi
+
+    if [[ -c "$tty" ]]; then
+        printf '\a' > "$tty"
+    else
+        printf '\a' 1>&2
+    fi
+}
+
+maybe_play_sound () {
+    local sound_file="${1:-}"
+    if (( try_sound_player )) && [[ -r "$sound_file" ]]; then
+        ( "$sound_player" "$sound_file" >/dev/null 2>&1 || true ) &
+    fi
+}
+
+maybe_desktop_notify () {
+    local message="CI finished"
+    local title="ci-wait"
+
+    if [[ -n "${1:-}" ]]; then
+        message="$message for $1"
+    fi
+
+    if (( try_desktop_notify )); then
+        if [[ "$OSTYPE" =~ ^[Dd]arwin ]]; then
+            ( osascript -e "display notification \"$message\" with title \"$title\"" >/dev/null 2>&1 || true ) &
+        else
+            # assume Linux, tested on Ubuntu, could do better
+            ( notify-send "$title" "$message" >/dev/null 2>&1 || true ) &
+        fi
+    fi
+}
+
+maybe_run_success_hook () {
+    if (( _try_success_hook )); then
+        ( "$success_hook" "${@:-}" >/dev/null 2>&1 || true ) &
+    fi
+}
+
+maybe_run_failure_hook () {
+    if (( _try_failure_hook )); then
+        ( "$failure_hook" "${@:-}" >/dev/null 2>&1 || true ) &
+    fi
+}
+
+maybe_emit_rolling_elapsed () {
+    local category true_elapsed tally median pretty_median
+
+    category="${1:-success}"
+    true_elapsed="${2:-0}"
+
+    if (( ! true_elapsed )); then
+        return
+    fi
+
+    median="$(update_rolling_elapsed "$category" "$true_elapsed" and_fetch)"
+    pretty_median="$(format_elapsed "$median")"
+
+    printf 'Median %s time: %s\n' "$category" "$pretty_median"
+}
+
+exercise_ui () {
+    local read_pause=1 after_pause=3 sound_name sound_file_ref sound_file
+    local progress_bar pending_checks max_iterations=10 i
+
+    printf '%s ...\n\n' maybe_create_progress_bar
+    sleep "$read_pause"
+    if (( try_progress_bar )); then
+        for i in $(seq 0 "$max_iterations"); do
+            pending_checks="$(( max_iterations - i ))"
+            progress_bar="$(maybe_create_progress_bar "$i" "$i" "$max_iterations" "$pending_checks")"
+            printf '\r%s' "$progress_bar"
+            sleep "$read_pause"
+        done
+        printf '\n\n'
+    else
+        printf '    %s\n\n' 'ci-wait.try-progress-bar is disabled'
+    fi
+    sleep "$after_pause"
+
+    printf '%s ...\n\n' maybe_emit_bell
+    sleep "$read_pause"
+    if (( try_emit_bell )); then
+        maybe_emit_bell
+    else
+        printf '    %s\n\n' 'ci-wait.try-emit-bell is disabled'
+    fi
+    sleep "$after_pause"
+
+    for sound_name in increment success failure; do
+        printf '%s ...\n\n' "maybe_play_${sound_name}_sound"
+        sleep "$read_pause"
+        sound_file_ref="${sound_name}_sound"
+        sound_file="${!sound_file_ref}"
+        if (( try_sound_player )); then
+            if [[ -r "$sound_file" ]]; then
+                maybe_play_sound "$sound_file"
+            else
+                printf '    %s: "%s"\n\n' "ci-wait.${sound_name}-sound is not found" "${sound_file}"
+            fi
+        else
+            printf '    %s\n\n' 'ci-wait.try-sound-player is disabled, or ci-wait.sound-player executable was not found'
+        fi
+        sleep "$after_pause"
+    done
+
+    printf '%s ...\n\n' maybe_desktop_notify
+    sleep "$read_pause"
+    if (( try_desktop_notify )); then
+        maybe_desktop_notify
+    else
+        printf '    %s\n\n' 'ci-wait.try-desktop-notify is disabled'
+    fi
+
+    if (( try_hooks )); then
+        sleep "$after_pause"
+
+        printf '%s ...\n\n' maybe_run_success_hook
+        sleep "$read_pause"
+        maybe_run_success_hook "status=success"        \
+                               "target=master"         \
+                               "total_checks=4"        \
+                               "pending_checks=0"      \
+                               "failed_checks=0"       \
+                               "passed_checks=4"       \
+                               "now=1604359534"        \
+                               "start_time=1604359000" \
+                               "iterations=18"
+
+        sleep "$after_pause"
+
+        printf '%s ...\n\n' maybe_run_failure_hook
+        sleep "$read_pause"
+        maybe_run_failure_hook "status=failure"        \
+                               "target=master"         \
+                               "total_checks=4"        \
+                               "pending_checks=2"      \
+                               "failed_checks=1"       \
+                               "passed_checks=1"       \
+                               "now=1604359534"        \
+                               "start_time=1604359000" \
+                               "iterations=18"
+    fi
+}
+
+###
+### main
+###
+
+_git-ci-wait () {
+    local target="${1:-}"
+    local start_time iterations=0 last_passed_checks=0 checks_tsv total_checks
+    local pending_checks failed_checks passed_checks ellipsis elapsed now mins
+    local secs pretty_elapsed mdn_elapsed spacer longest_test progress_bar
+
+    # remembering an implicit target frees the user to check out a new branch
+    if [[ -z "$target" ]]; then
+        target="$(git rev-parse --abbrev-ref HEAD)"
+    fi
+
+    ensure_target "$target"
+
+    spacer="$(printf ' %.0s' {1..45})"
+    start_time="$(date '+%s')"
+    mdn_elapsed="$(fetch_rolling_elapsed success)"
+
+    # helps in case of git push -f && git ci-wait
+    sleep "${before_poll_seconds:-0}"
+
+    while true; do
+
+        (( ++iterations ))
+
+        checks_tsv="$(gh pr checks "$target" 2>/dev/null || true)"
+        total_checks="$(printf '%s\n' "$checks_tsv" | grep -Ec . || true)"
+        pending_checks="$(printf '%s\n' "$checks_tsv" | cut -f2 | grep -Ec pending || true)"
+        failed_checks="$(printf '%s\n' "$checks_tsv" | cut -f2 | grep -Ec fail || true)"
+        passed_checks="$(printf '%s\n' "$checks_tsv" | cut -f2 | grep -Ec pass || true)"
+        longest_test="$(longest_test_elapsed "$checks_tsv")"
+
+        (( passed_checks == total_checks )) && ellipsis='' || ellipsis=' ...'
+
+        now="$(date '+%s')"
+        elapsed="$(( now - start_time ))"
+        pretty_elapsed=''
+        if (( elapsed > 6 )); then
+            pretty_elapsed="$(format_elapsed "$elapsed")"
+            pretty_elapsed=" ($pretty_elapsed)"
+        fi
+
+        if (( total_checks )); then
+
+            progress_bar="$(maybe_create_progress_bar "$elapsed" "$longest_test" "$mdn_elapsed" "$pending_checks")"
+            if (( iterations == 1 && pending_checks == 0 )); then
+                progress_bar=''
+            fi
+
+            printf '\r%s%s' "$progress_bar" "$spacer"
+            printf '\r%sCI %s/%s%s%s' "$progress_bar" "$passed_checks" "$total_checks" "$ellipsis" "$pretty_elapsed"
+            if (( passed_checks > last_passed_checks )); then
+                maybe_play_sound "$increment_sound"
+            fi
+        else
+            printf '\r%sCI waiting to start ...%s' "$progress_bar" "$pretty_elapsed"
+        fi
+
+        last_passed_checks="$passed_checks"
+
+        if (( total_checks > 0 && pending_checks == 0 )); then
+            break
+        fi
+        if (( failed_checks && exit_early_on_fail )); then
+            break
+        fi
+        if (( now > start_time + timeout_seconds )); then
+            break
+        fi
+
+        if (( mdn_elapsed && elapsed >= ((mdn_elapsed * fast_poll_percent)/100) )); then
+            sleep "$fast_poll_seconds"
+        elif (( ! total_checks )); then
+            sleep "$fast_poll_seconds"
+        else
+            sleep "$slow_poll_seconds"
+        fi
+
+    done
+
+    printf '\n'
+
+    if (( iterations > 1 )); then
+        maybe_emit_bell
+
+        if (( failed_checks || pending_checks )); then
+            maybe_play_sound "$failure_sound"
+
+            maybe_run_failure_hook "status=failure"                 \
+                                   "target=$target"                 \
+                                   "total_checks=$total_checks"     \
+                                   "pending_checks=$pending_checks" \
+                                   "failed_checks=$failed_checks"   \
+                                   "passed_checks=$passed_checks"   \
+                                   "now=$now"                       \
+                                   "start_time=$start_time"         \
+                                   "iterations=$iterations"
+
+            maybe_emit_rolling_elapsed failure "$longest_test"
+        else
+            maybe_play_sound "$success_sound"
+
+            maybe_run_success_hook "status=success"                 \
+                                   "target=$target"                 \
+                                   "total_checks=$total_checks"     \
+                                   "pending_checks=$pending_checks" \
+                                   "failed_checks=$failed_checks"   \
+                                   "passed_checks=$passed_checks"   \
+                                   "now=$now"                       \
+                                   "start_time=$start_time"         \
+                                   "iterations=$iterations"
+
+            maybe_emit_rolling_elapsed success "$longest_test"
+        fi
+
+        maybe_desktop_notify "$target"
+    fi
+
+    gh pr checks "$target"
+}
+
+###
+### argument processing
+###
+
+usage="[ -help | -version | -test-ui | -clear_stats ] [ <branch> | <pr-number> | <url> ]
+
+Wait for GitHub CI to complete, using the \"gh\" tool.
+
+Arguments
+
+    By default, the target is the checked-out branch in the current repository.
+
+    Optionally, a single argument may be given to specify the target.  See
+    \"gh pr --help\" for the accepted forms.
+
+Options
+
+    -help         Print this usage document.
+
+    -version      Emit script version.
+
+    -test_ui      Test sounds and notifications, without consulting CI.
+
+    -clear_stats  Clear historical runtime statistics for the current
+                  repository.
+
+Settings
+
+    Settings may be adjusted in the script, or set via \"git config\".
+
+    The default settings are
+
+    # integer/boolean settings
+
+        git config --global ci-wait.before-poll-seconds '$before_poll_seconds'
+        git config --global ci-wait.slow-poll-seconds   '$slow_poll_seconds'
+        git config --global ci-wait.fast-poll-seconds   '$fast_poll_seconds'
+        git config --global ci-wait.fast-poll-percent   '$fast_poll_percent'
+        git config --global ci-wait.timeout-seconds     '$timeout_seconds'
+        git config --global ci-wait.exit-early-on-fail  '$exit_early_on_fail'
+        git config --global ci-wait.progress-bar-width  '$progress_bar_width'
+        git config --global ci-wait.try-progress-bar    '$try_progress_bar'
+        git config --global ci-wait.try-emit-bell       '$try_emit_bell'
+        git config --global ci-wait.try-desktop-notify  '$try_desktop_notify'
+        git config --global ci-wait.try-sound-player    '$try_sound_player'
+
+    # pathname settings
+
+        git config --global ci-wait.sound-player    '$sound_player'
+        git config --global ci-wait.increment-sound '$increment_sound'
+        git config --global ci-wait.success-sound   '$success_sound'
+        git config --global ci-wait.failure-sound   '$failure_sound'
+
+    For integer settings, \"false\" is equivalent to \"0\", which disables
+    the relevant feature, and \"true\" is equivalent to \"1\".
+
+    For pathnames, a leading \"~/\" will be expanded.  \"false\" is equivalent
+    to the empty string, which, like any nonexistent pathname, disables the
+    relevant feature.
+
+"
+
+while [[ "$#" -ge 1 ]]; do
+    elt="$1" && shift
+    case "$elt" in
+        -help|--help|-h)
+            printf '%s %s' "$progname" "$usage"
+            exit
+            ;;
+        -version|--version)
+            printf '%s\n' "$version"
+            exit
+            ;;
+        -test-ui|--test-ui|-test_ui|--test_ui)
+            ensure_bash_version
+            ensure_git_on_path
+            fetch_gitconfig_settings
+            check_sound_player
+            check_desktop_notify
+            check_hooks
+            init_progress_bar
+            exercise_ui
+            exit
+            ;;
+        -clear-stats|--clear-stats|-clear_stats|--clear_stats|-clear-statistics|--clear-statistics|-clear_statistics|--clear_statistics)
+            ensure_bash_version
+            ensure_git_on_path
+            clear_rolling_elapsed success
+            clear_rolling_elapsed failure
+            exit
+            ;;
+        --)
+            opt_targets+=("${@}")
+            break
+            ;;
+        -*)
+            die "No such option: '$elt'"
+            ;;
+        *)
+            opt_targets+=("$elt")
+            ;;
+    esac
+done
+
+if [[ "${#opt_targets[@]}" -gt 1 ]]; then
+    die "Only one target may be given."
+fi
+
+###
+### initialization
+###
+
+ensure_bash_version
+ensure_git_on_path
+ensure_in_repo
+ensure_gh_on_path
+ensure_gh_runs
+fetch_gitconfig_settings
+check_sound_player
+check_desktop_notify
+check_hooks
+init_progress_bar
+
+###
+### dispatch
+###
+
+_git-ci-wait "${opt_targets[@]:-}"
+
+#
+# Emacs
+#
+# Local Variables:
+# sh-shell: bash
+# coding: utf-8
+# End:
+#
+# LocalWords:
+#
