@@ -290,6 +290,40 @@ longest_test_elapsed () {
     printf '%s' "${longest_elapsed:-0}"
 }
 
+rewrite_target () {
+    local target="${1:-}"
+
+    local origin_url origin_user
+
+    # remembering an implicit target frees the user to check out a new branch
+    if [[ -z "$target" ]]; then
+        target="$(git rev-parse --abbrev-ref HEAD)"
+    fi
+
+    if [[ "$target" =~ ":" || "$target" =~ ^[0-9]+$ || "$target" =~ "#" ]]; then
+        printf '%s' "$target"
+        return
+    fi
+
+    if ! git config --local --get-regexp '^remote\..*\.gh-resolved$' >/dev/null 2>&1; then
+        printf '%s' "$target"
+        return
+    fi
+
+    if ! origin_url="$(git config --local remote.origin.url)"; then
+        printf '%s' "$target"
+        return
+    fi
+
+    if [[ "$origin_url" =~ "@" ]]; then
+        origin_user="$(printf '%s' "$origin_url" | cut -f2- -d: | cut -f1 -d/)"
+    else
+        origin_user="$(printf '%s' "$origin_url" | cut -f4 -d/)"
+    fi
+
+    printf '%s:%s' "$origin_user" "$target"
+}
+
 ensure_target () {
     local target="${1:-}"
     if ! gh pr view "$target" >/dev/null 2>&1; then
@@ -634,11 +668,7 @@ _git-ci-wait () {
     local pending_checks failed_checks passed_checks ellipsis elapsed now mins
     local secs pretty_elapsed mdn_elapsed spacer longest_test progress_bar
 
-    # remembering an implicit target frees the user to check out a new branch
-    if [[ -z "$target" ]]; then
-        target="$(git rev-parse --abbrev-ref HEAD)"
-    fi
-
+    target="$(rewrite_target "$target")"
     ensure_target "$target"
 
     spacer="$(printf ' %.0s' {1..45})"
