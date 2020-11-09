@@ -327,7 +327,7 @@ rewrite_target () {
 ensure_target () {
     local target="${1:-}"
     if ! gh pr view "$target" >/dev/null 2>&1; then
-        die "${target:-current branch}" 'does not correspond to a PR'
+        die "${target:-current branch}" "may not correspond to a PR, or you may need to set a base repository.  Try running 'gh repo view' and 'gh pr view ${target:-}'."
     fi
 }
 
