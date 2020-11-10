@@ -293,7 +293,7 @@ longest_test_elapsed () {
 rewrite_target () {
     local target="${1:-}"
 
-    local origin_url origin_user
+    local config_table origin_url origin_user
 
     # remembering an implicit target frees the user to check out a new branch
     if [[ -z "$target" ]]; then
@@ -305,7 +305,12 @@ rewrite_target () {
         return
     fi
 
-    if ! git config --local --get-regexp '^remote\..*\.gh-resolved$' >/dev/null 2>&1; then
+    if ! config_table="$(git config --local --get-regexp '^remote\..*\.gh-resolved$' 2>/dev/null)"; then
+        printf '%s' "$target"
+        return
+    fi
+
+    if [[ "$config_table" = 'remote.origin.gh-resolved base' ]]; then
         printf '%s' "$target"
         return
     fi
