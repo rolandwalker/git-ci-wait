@@ -163,7 +163,7 @@ warn () {
     [[ -z "$message" ]] && message="Empty message!"
 
     if [[ -n "$opt_escapes" ]]; then
-        print -v message -- "$message"
+        printf -v message -- "$message"
     fi
     message="${message%"${message##*[![:space:]]}"}"
     printf "%s%s\n" "$prefix" "$message" 1>&2
